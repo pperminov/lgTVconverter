@@ -76,6 +76,7 @@ def get_stream_info(input_file: str) -> List[dict]:
                 'codec_type': stream.get('codec_type', ''),
                 'codec_name': stream.get('codec_name', ''),
                 'channels': stream.get('channels', 0),
+                'channel_layout': stream.get('channel_layout', ''),
                 'bit_rate': stream.get('bit_rate', '0'),
                 'tags': stream.get('tags', {})
             }
@@ -141,17 +142,20 @@ def extract_tracks(mkv_file: str, params: ProcessingParams) -> Tuple[
     )
 
     for idx, stream in enumerate(streams):
+        cmd = None
         stream_type = stream['codec_type']
         codec_name = stream['codec_name'].lower()
         channels = stream.get('channels', 0)
+        channel_layout = stream.get('channel_layout', '')
         lang = stream.get('tags', {}).get('language', 'und')
+        lang_normalized = lang.lower() if isinstance(lang, str) else 'und'
 
         # Define output file for this stream
         output_file = output_dir / f'{hash_hex}_{stream_type}_track_{idx}.mkv'
-        logging.info(f"Extracting {stream_type} track {idx} ({lang}) to {output_file}")
 
         # Process each stream type
         if stream_type == 'video':
+            logging.info(f"Extracting {stream_type} track {idx} ({lang}) to {output_file}")
             video.append((str(output_file), lang))
             if needs_encoding:
                 # Re-encode video to H.264 using NVIDIA GPU
@@ -205,21 +209,45 @@ def extract_tracks(mkv_file: str, params: ProcessingParams) -> Tuple[
                     str(output_file)
                 ]
         elif stream_type == 'audio':
-            if not has_language_tags or not params.english_only or lang == 'eng':
+            should_include_audio = (
+                not params.english_only
+                or lang_normalized in ('eng', 'en')
+                or not has_language_tags
+                or lang_normalized in ('und', '')
+            )
+            if should_include_audio:
+                logging.info(f"Extracting {stream_type} track {idx} ({lang}) to {output_file}")
                 audio.append((str(output_file), lang))
                 # Check if audio is DTS/DTS-HD and needs conversion
                 if codec_name in ['dts', 'dtshd', 'dts-hd', 'dtshd_ma']:
-                    logging.info(f"Converting DTS audio track {idx} to AAC with {channels} channels")
+                    logging.info(f"Converting DTS audio track {idx} to E-AC-3 with {channels} channels")
+
+                    if channels >= 5:
+                        bitrate = '1500k'
+                    else:
+                        bitrate = '640k'
+
+                    layout_map = {
+                        1: 'mono',
+                        2: 'stereo',
+                        3: '2.1',
+                        6: '5.1',
+                        7: '6.1',
+                        8: '7.1'
+                    }
+
+                    selected_layout = channel_layout.strip() if channel_layout else layout_map.get(channels)
                     cmd = [
                         'ffmpeg',
                         '-i', mkv_file,
                         '-map', f'0:{idx}',
-                        '-c:a', 'aac',
-                        '-b:a', '0',  # Use maximum bitrate
-                        '-ac', str(channels),  # Maintain original channel configuration
-                        '-y',
-                        str(output_file)
+                        '-c:a', 'eac3',
+                        '-b:a', bitrate,
+                        '-ac', str(channels),
                     ]
+                    if selected_layout:
+                        cmd.extend(['-channel_layout', selected_layout])
+                    cmd.extend(['-y', str(output_file)])
                 else:
                     cmd = [
                         'ffmpeg',
@@ -231,6 +259,7 @@ def extract_tracks(mkv_file: str, params: ProcessingParams) -> Tuple[
                     ]
         elif stream_type == 'subtitle':
             if not params.english_only or lang == 'eng':
+                logging.info(f"Extracting {stream_type} track {idx} ({lang}) to {output_file}")
                 subtitle.append((str(output_file), lang))
                 cmd = [
                     'ffmpeg',
@@ -241,13 +270,14 @@ def extract_tracks(mkv_file: str, params: ProcessingParams) -> Tuple[
                     str(output_file)
                 ]
 
-        try:
-            log_file = logs_dir / f"ffmpeg_extract_{hash_hex}_{stream_type}_{idx}.log"
-            run_ffmpeg(cmd, log_file)
-            logging.debug(f"Successfully extracted {stream_type} track {idx}")
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Failed to extract {stream_type} track {idx}: {e}")
-            raise
+        if cmd:
+            try:
+                log_file = logs_dir / f"ffmpeg_extract_{hash_hex}_{stream_type}_{idx}.log"
+                run_ffmpeg(cmd, log_file)
+                logging.debug(f"Successfully extracted {stream_type} track {idx}")
+            except subprocess.CalledProcessError as e:
+                logging.error(f"Failed to extract {stream_type} track {idx}: {e}")
+                raise
 
     logging.info(f"Extraction complete: {len(video)} video, {len(audio)} audio, {len(subtitle)} subtitle tracks")
     return video, audio, subtitle
@@ -433,9 +463,13 @@ def main() -> None:
     )
 
     try:
+        extensions = ["mov", "mkv", "avi", "mp4", "mpg"]
         files = []
         for root, dirs, filenames in os.walk(dir_to_process):
             for filename in filenames:
+                extension = filename.split(".")[-1].lower()
+                if extension not in extensions:
+                    continue
                 file_path = os.path.join(root, filename)
                 if is_video_file(file_path):
                     files.append(file_path)
